@@ -6,18 +6,42 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 
-type Clip = { url: string; title: string; reason: string; hashtags: string[]; score: number; start: number; end: number }
+type Clip = { url: string; title: string; reason: string; hashtags: string[]; score: number; start: number; end: number; reframe?: string }
 type Job = { id: string; status: string; stage: string; progress: number; title?: string; clips: Clip[]; error?: string }
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`
 
+const MODES = { blur: "Fondo desenfocado", crop: "Recorte central", face: "Seguir cara" } as const
+const REFRAME: Record<string, string> = {
+  blur: "Fondo desenfocado",
+  crop: "Recorte central",
+  face: "Seguimiento de cara",
+  fallback: "Fondo desenfocado (no se detectaron caras)",
+}
+
+const PRESETS = [
+  { label: "Cortos 15–30 s", lo: 15, hi: 30 },
+  { label: "Medios 30–60 s", lo: 30, hi: 60 },
+  { label: "Largos 60–120 s", lo: 60, hi: 120 },
+]
+
+const ZOOMS = [
+  { label: "Sin zoom", v: 0 },
+  { label: "Suave", v: 0.08 },
+  { label: "Medio", v: 0.12 },
+  { label: "Fuerte", v: 0.18 },
+]
+
 export default function App() {
   const [url, setUrl] = useState("")
   const [n, setN] = useState(5)
-  const [mode, setMode] = useState<"blur" | "crop">("blur")
+  const [mode, setMode] = useState<keyof typeof MODES>("blur")
+  const [len, setLen] = useState({ lo: 20, hi: 60 })
+  const [zoom, setZoom] = useState(0.12)
   const [job, setJob] = useState<Job | null>(null)
   const [err, setErr] = useState("")
   const busy = job?.status === "running"
+  const badLen = len.lo >= len.hi
 
   useEffect(() => {
     if (!busy || !job) return
@@ -30,9 +54,12 @@ export default function App() {
     const r = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, num_clips: n, mode }),
+      body: JSON.stringify({ url, num_clips: n, mode, min_len: len.lo, max_len: len.hi, zoom }),
     })
-    if (!r.ok) return setErr((await r.json()).detail ?? "No se pudo iniciar")
+    if (!r.ok) {
+      const d = (await r.json()).detail
+      return setErr(typeof d === "string" ? d : "Revisa los ajustes")
+    }
     setJob(await r.json())
   }
 
@@ -54,16 +81,50 @@ export default function App() {
               <Input type="number" min={1} max={10} value={n} onChange={(e) => setN(+e.target.value)} className="w-20" disabled={busy} />
             </label>
             <div className="flex gap-2">
-              {(["blur", "crop"] as const).map((m) => (
+              {(Object.keys(MODES) as (keyof typeof MODES)[]).map((m) => (
                 <Button key={m} size="sm" variant={mode === m ? "default" : "outline"} onClick={() => setMode(m)} disabled={busy}>
-                  {m === "blur" ? "Fondo desenfocado" : "Recorte central"}
+                  {MODES[m]}
                 </Button>
               ))}
             </div>
-            <Button className="ml-auto" onClick={start} disabled={busy || !url}>
+            <Button className="ml-auto" onClick={start} disabled={busy || !url || badLen}>
               {busy && <Loader2 className="size-4 animate-spin" />} Generar clips
             </Button>
           </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="mr-1">Duración</span>
+            {PRESETS.map((p) => (
+              <Button key={p.label} size="sm" disabled={busy}
+                variant={len.lo === p.lo && len.hi === p.hi ? "default" : "outline"}
+                onClick={() => setLen({ lo: p.lo, hi: p.hi })}>
+                {p.label}
+              </Button>
+            ))}
+            <label className="ml-2 flex items-center gap-1">
+              Mín
+              <Input type="number" min={5} max={170} value={len.lo} className="w-20" disabled={busy}
+                onChange={(e) => setLen({ ...len, lo: +e.target.value })} />
+            </label>
+            <label className="flex items-center gap-1">
+              Máx
+              <Input type="number" min={10} max={180} value={len.hi} className="w-20" disabled={busy}
+                onChange={(e) => setLen({ ...len, hi: +e.target.value })} />
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="mr-1">Zoom</span>
+            {ZOOMS.map((z) => (
+              <Button key={z.label} size="sm" disabled={busy}
+                variant={zoom === z.v ? "default" : "outline"}
+                onClick={() => setZoom(z.v)}>
+                {z.label}
+              </Button>
+            ))}
+          </div>
+
+          {badLen && <p className="text-sm text-destructive">El mínimo debe ser menor que el máximo.</p>}
           {err && <p className="text-sm text-destructive">{err}</p>}
         </CardContent>
       </Card>
@@ -91,7 +152,7 @@ export default function App() {
               </div>
               <p className="text-sm text-muted-foreground">{c.reason}</p>
               <p className="text-xs text-muted-foreground">
-                {fmt(c.start)}–{fmt(c.end)} del original · {c.hashtags.map((h) => (h.startsWith("#") ? h : "#" + h)).join(" ")}
+                {fmt(c.start)}–{fmt(c.end)} del original · {c.reframe && REFRAME[c.reframe] ? REFRAME[c.reframe] + " · " : ""}{c.hashtags.map((h) => (h.startsWith("#") ? h : "#" + h)).join(" ")}
               </p>
               <a href={c.url} download>
                 <Button variant="secondary" size="sm"><Download className="size-4" /> Descargar</Button>
