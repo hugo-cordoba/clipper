@@ -3,4 +3,5 @@ uvicorn>=0.30
 yt-dlp[default]
 mlx-whisper
 httpx
-opencv-python-headless<5
+numpy
+mediapipe

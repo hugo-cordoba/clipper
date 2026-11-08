@@ -17,10 +17,12 @@ LOCK = threading.Lock()  # un solo trabajo a la vez (8 GB de RAM)
 class Req(BaseModel):
     url: str
     num_clips: int = Field(5, ge=1, le=10)
-    mode: Literal["blur", "crop", "face"] = "blur"
+    mode: Literal["blur", "crop", "speaker"] = "blur"  # speaker = seguir al que habla
     min_len: int = Field(20, ge=5, le=170)
     max_len: int = Field(60, ge=10, le=180)
     zoom: float = Field(0.12, ge=0, le=0.4)  # 0 = sin zoom
+    aspect: Literal["9:16", "16:9"] = "9:16"  # 16:9 = formato YouTube, a pantalla completa
+    framing: float = Field(0.17, ge=0.08, le=0.45)  # solo 16:9 + speaker: cuánto ocupa la cara
 
 
 def work(jid: str, r: Req):
@@ -31,7 +33,7 @@ def work(jid: str, r: Req):
 
     with LOCK:
         try:
-            opts = pipeline.Opts(r.num_clips, r.mode, r.min_len, r.max_len, r.zoom)
+            opts = pipeline.Opts(r.num_clips, r.mode, r.min_len, r.max_len, r.zoom, r.aspect, r.framing)
             title, clips = pipeline.run(r.url, OUT / jid, opts, progress)
             for c in clips:
                 c["url"] = f"/clips/{jid}/{c['file']}"

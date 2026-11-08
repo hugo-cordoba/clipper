@@ -1,7 +1,8 @@
-import json, os, re, subprocess, gc, shutil, tempfile
+import json, os, re, subprocess, gc
 from dataclasses import dataclass
 from pathlib import Path
 import httpx
+import numpy as np
 import yt_dlp
 
 LLM = os.environ.get("CLIPPER_LLM", "qwen3:4b")
@@ -11,13 +12,34 @@ FFMPEG = next((x for x in ("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",) if os.pa
 COOKIES = os.environ.get("CLIPPER_COOKIES_BROWSER", "")
 COOKIES_FILE = os.environ.get("CLIPPER_COOKIES_FILE", "")
 
+# --- Seguir al que habla ---
+YUNET = Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx"
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+SAMPLE_FPS = 6             # muestras de cara por segundo
+SAMPLE_W = 1280            # ancho al que se analizan los fotogramas
+HOLD = 3 * SAMPLE_FPS      # una cara perdida se sigue buscando 3 s
+MIN_TRACK = 5              # muestras mínimas para que una pista cuente como persona
+CUT_DIFF = 15              # diferencia media (0-255) entre miniaturas que cuenta como corte de plano
+MIN_SHOT = 1.5             # s: duración mínima de un plano al cambiar de hablante
+SWITCH = 1.25              # el nuevo hablante debe mover la boca un 25 % más que el actual
+MIN_ACT = 0.12             # movimiento de boca mínimo para considerar que alguien habla
+MAX_ZOOM = 2.5             # recorte máximo sobre el original (más borroso a partir de aquí)
+FACE_Y = 0.42              # la cara queda al 42 % de la altura del encuadre
+
+
 @dataclass
 class Opts:
     num_clips: int = 5
-    mode: str = "blur"
+    mode: str = "blur"       # blur | crop | speaker
     min_len: int = 20
     max_len: int = 60
     zoom: float = 0.12
+    aspect: str = "9:16"     # "9:16" vertical | "16:9" horizontal (YouTube)
+    framing: float = 0.17    # solo 16:9 + speaker: ancho de la cara / ancho del encuadre (menor = plano más abierto)
+
+
+def _size(o: Opts):
+    return (1920, 1080) if o.aspect == "16:9" else (1080, 1920)
 
 
 def download(url, out: Path):
@@ -139,17 +161,20 @@ def pick_clips(segs, heatmap, o: Opts, progress):
     return picked
 
 
-def _ass(words, path):
+def _ass(words, path, W=1080, H=1920):
     def t(x):
         return f"{int(x // 3600)}:{int(x % 3600 // 60):02d}:{x % 60:05.2f}"
-    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\n"
+    # (tamaño, contorno, margen vertical, margen lateral, palabras por línea)
+    size, outline, mv, mlr, per = (78, 6, 420, 60, 3) if H > W else (62, 4, 70, 160, 4)
+    head = ("[Script Info]\nScriptType: v4.00+\n"
+            f"PlayResX: {W}\nPlayResY: {H}\n\n[V4+ Styles]\n"
             "Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,"
             "ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
-            "Style: D,Arial,78,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,2,2,60,60,420,1\n\n"
+            f"Style: D,Arial,{size},&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,{outline},2,2,{mlr},{mlr},{mv},1\n\n"
             "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n")
     lines = []
-    for i in range(0, len(words), 3):
-        g = words[i:i + 3]
+    for i in range(0, len(words), per):
+        g = words[i:i + per]
         txt = " ".join(w["word"].strip() for w in g).upper().replace("\\", "")
         lines.append(f"Dialogue: 0,{t(g[0]['start'])},{t(g[-1]['end'])},D,,0,0,0,,{txt}")
     Path(path).write_text(head + "\n".join(lines), encoding="utf-8")
@@ -178,102 +203,401 @@ def _zoom_expr(beats, amount, ramp=0.25):
     return f"1+{amount}*({'+'.join(terms)})" if terms else "1"
 
 
-def _sample_faces(src, st, en, work: Path, fps=2):
-    """Detecta caras ~2 veces por segundo. Devuelve (proporción ancho/alto, [[(centro_x 0-1, área), ...] por muestra])."""
+# ---------------------------------------------------------------------------
+# Seguir al que habla: detección de caras, quién mueve la boca, planos y recorte
+# ---------------------------------------------------------------------------
+
+def _dims(src):
     import cv2
-    cmd = [FFMPEG, "-y", "-ss", str(st), "-to", str(en), "-i", str(src),
-           "-vf", f"fps={fps},scale=640:-2", "-q:v", "4", str(work / "f%04d.jpg")]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    cap = cv2.VideoCapture(str(src))
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if not w or not h:
+        raise RuntimeError("No pude leer las dimensiones del vídeo")
+    return w, h
+
+
+def _detector():
+    """Devuelve detect(bgr, gris) -> [(cx, cy, ancho, alto, boca_x, boca_y, boca_ancho)] en px.
+    Usa YuNet (caras de frente y de perfil, con puntos de la boca) y, si no está disponible, Haar."""
+    import cv2
+    if not YUNET.exists():
+        try:
+            YUNET.parent.mkdir(exist_ok=True)
+            r = httpx.get(YUNET_URL, follow_redirects=True, timeout=60)
+            r.raise_for_status()
+            if len(r.content) < 50_000:
+                raise ValueError("descarga incompleta")
+            YUNET.write_bytes(r.content)
+        except Exception as e:
+            print("[clipper] No pude bajar YuNet, uso Haar (peor con caras de perfil):", e)
+    if YUNET.exists() and hasattr(cv2, "FaceDetectorYN"):
+        try:
+            net = cv2.FaceDetectorYN.create(str(YUNET), "", (320, 320), 0.6, 0.3, 500)
+        except Exception as e:
+            net = None
+            print("[clipper] YuNet no arranca, uso Haar:", e)
+        if net is not None:
+            def det(img, gray):
+                h, w = gray.shape
+                net.setInputSize((w, h))
+                _, faces = net.detect(img)
+                out = []
+                for f in (faces if faces is not None else []):
+                    x, y, fw, fh = (float(v) for v in f[:4])
+                    if fw < 0.035 * w:
+                        continue
+                    mx, my = (f[10] + f[12]) / 2, (f[11] + f[13]) / 2
+                    mw = float(np.hypot(f[10] - f[12], f[11] - f[13]))
+                    if not (x <= mx <= x + fw and y <= my <= y + fh) or mw < 0.2 * fw:
+                        mx, my, mw = x + fw / 2, y + 0.78 * fh, 0.5 * fw
+                    out.append((x + fw / 2, y + fh / 2, fw, fh, float(mx), float(my), mw))
+                return out
+            return det
+    cas = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    def det_haar(img, gray):
+        h, w = gray.shape
+        g = cv2.equalizeHist(gray)
+        return [(x + fw / 2, y + fh / 2, float(fw), float(fh), x + fw / 2, y + 0.78 * fh, 0.5 * fw)
+                for x, y, fw, fh in cas.detectMultiScale(g, 1.1, 5, minSize=(w // 25, w // 25))]
+    return det_haar
+
+
+def _scene_cuts(src, st, en, fps=50):
+    """Instantes (s, relativos al clip) en los que el propio vídeo original cambia de plano."""
+    cmd = [FFMPEG, "-v", "error", "-ss", str(st), "-to", str(en), "-i", str(src),
+           "-vf", f"fps={fps},scale=32:18:flags=area,format=gray", "-f", "rawvideo", "-"]
+    p = subprocess.run(cmd, capture_output=True)
     if p.returncode:
-        raise RuntimeError("FFmpeg falló al muestrear: " + p.stderr[-300:])
-    det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    out, aspect = [], None
-    for f in sorted(work.glob("f*.jpg")):
-        img = cv2.imread(str(f))
-        if img is None:
-            out.append([])
-            continue
-        h, w = img.shape[:2]
-        aspect = w / h
-        gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-        faces = det.detectMultiScale(gray, 1.1, 5, minSize=(w // 25, w // 25))
-        out.append([((x + fw / 2) / w, fw * fh / (w * h)) for x, y, fw, fh in faces])
-    return aspect, out
+        raise RuntimeError("FFmpeg falló al buscar cortes: " + p.stderr.decode(errors="ignore")[-300:])
+    a = np.frombuffer(p.stdout, np.uint8)
+    a = a[: len(a) // 576 * 576].reshape(-1, 18, 32).astype(np.float32)
+    if len(a) < 2:
+        return []
+    d = np.abs(np.diff(a, axis=0)).mean(axis=(1, 2))
+    cuts = []
+    for i in np.nonzero(d > CUT_DIFF)[0]:
+        c = round((i + 1) / fps, 3)
+        if not cuts or c - cuts[-1] > 0.3:
+            cuts.append(c)
+    return cuts
 
 
-def _cam_path(samples, fps=2, dead=0.03, alpha=0.4):
-    """Cámara virtual estable: elige una cara por muestra, suaviza y solo se mueve si la cara se aleja del centro.
-    Devuelve keyframes [(t, centro_x)] o None si casi no hay caras."""
-    if not samples or sum(1 for s in samples if s) < 0.3 * len(samples):
+class _Track:
+    """Una persona seguida a lo largo del clip."""
+    def __init__(self, i):
+        self.first = self.last = i
+        self.box = None      # caja suavizada [cx, cy, w, h, boca_x, boca_y, boca_w] en px
+        self.patch = None    # última imagen de la boca (normalizada)
+        self.pos = {}        # muestra -> (cx, cy, w, h) normalizados 0-1
+        self.mot = {}        # muestra -> cuánto cambió la boca respecto a la muestra anterior
+        self.open = True
+
+
+def _mouth_patch(gray, b):
+    import cv2
+    h, w = gray.shape
+    pw = min(w, max(10, int(b[6] * 1.4)))
+    ph = min(h, max(8, int(pw * 0.7)))
+    x0 = min(max(int(b[4] - pw / 2), 0), w - pw)
+    y0 = min(max(int(b[5] - ph / 2), 0), h - ph)
+    p = gray[y0:y0 + ph, x0:x0 + pw]
+    if p.size == 0:
         return None
-    pos, prev = [], None
-    for faces in samples:
-        if faces:
-            big = max(faces, key=lambda f: f[1])
-            if prev is not None:  # histéresis: no saltar de persona por una diferencia pequeña de tamaño
-                near = min(faces, key=lambda f: abs(f[0] - prev))
-                if abs(near[0] - prev) < 0.15 and near[1] >= 0.6 * big[1]:
-                    big = near
-            prev = big[0]
-        pos.append(prev)
-    first = next(p for p in pos if p is not None)
-    pos = [first if p is None else p for p in pos]
-    sm = []
-    for i in range(len(pos)):  # mediana de 5 muestras: quita falsos positivos sueltos
-        w = sorted(pos[max(0, i - 2):i + 3])
-        sm.append(w[len(w) // 2])
-    cam, c = [], sm[0]
-    for v in sm:
-        if abs(v - c) > dead:
-            c += (v - c) * alpha
-        cam.append(round(c, 3))
-    n = len(cam)
-    keep = [i for i in range(n) if i in (0, n - 1) or cam[i] != cam[i - 1] or cam[i] != cam[i + 1]]
-    return [(i / fps, cam[i]) for i in keep]
+    p = cv2.resize(p, (24, 16), interpolation=cv2.INTER_AREA).astype(np.float32)
+    return (p - p.mean()) / (p.std() + 1.0)
 
 
-def _pan_expr(keys):
-    """Expresión de FFmpeg: interpolación lineal entre keyframes (centro_x 0-1) en función de t."""
-    if len(keys) == 1:
-        return f"{keys[0][1]}"
-    terms = [f"gte(t,{t0:.2f})*lt(t,{t1:.2f})*({v0}+({v1 - v0:.4f})*(t-{t0:.2f})/{t1 - t0:.2f})"
-             for (t0, v0), (t1, v1) in zip(keys, keys[1:])]
-    terms.append(f"gte(t,{keys[-1][0]:.2f})*{keys[-1][1]}")
+def _track_step(tracks, i, faces, gray):
+    h, w = gray.shape
+    live = [t for t in tracks if t.open and i - t.last <= HOLD]
+    used = set()
+    for f in sorted(faces, key=lambda f: -f[2]):
+        best, bd = None, 0.9
+        for t in live:
+            if id(t) in used:
+                continue
+            d = np.hypot(f[0] - t.box[0], f[1] - t.box[1]) / max(f[2], t.box[2])
+            if d < bd:
+                best, bd = t, d
+        if best is None:
+            best = _Track(i)
+            best.box = np.array(f, float)
+            tracks.append(best)
+        else:
+            best.box = 0.5 * best.box + 0.5 * np.array(f, float)  # suaviza el temblor del detector
+        used.add(id(best))
+        patch = _mouth_patch(gray, best.box)
+        if patch is not None and best.patch is not None and best.last == i - 1:
+            best.mot[i] = float(np.abs(patch - best.patch).mean())
+        best.patch = patch
+        best.last = i
+        b = best.box
+        best.pos[i] = (b[0] / w, b[1] / h, b[2] / w, b[3] / h)
+
+
+def _sample(src, st, en, cuts, detect):
+    """Detecta caras SAMPLE_FPS veces por segundo, las enlaza en pistas y mide el movimiento de la boca.
+    Devuelve (nº de muestras, pistas)."""
+    import cv2
+    sw0, sh0 = _dims(src)
+    w = min(SAMPLE_W, sw0) // 2 * 2
+    h = round(sh0 * w / sw0) // 2 * 2
+    cmd = [FFMPEG, "-v", "error", "-ss", str(st), "-to", str(en), "-i", str(src),
+           "-vf", f"fps={SAMPLE_FPS},scale={w}:{h}", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    size, tracks, i = w * h * 3, [], 0
+    while True:
+        buf = p.stdout.read(size)
+        if len(buf) < size:
+            break
+        img = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if any((i - 1) / SAMPLE_FPS < c <= i / SAMPLE_FPS for c in cuts):  # otro plano: nadie sigue siendo el mismo
+            for t in tracks:
+                t.open = False
+        _track_step(tracks, i, detect(img, gray), gray)
+        i += 1
+    p.stdout.close()
+    err = p.stderr.read().decode(errors="ignore")
+    if p.wait() and i == 0:
+        raise RuntimeError("FFmpeg falló al muestrear: " + err[-300:])
+    return i, [t for t in tracks if len(t.pos) >= MIN_TRACK]
+
+
+def _speech_mask(words, n):
+    m = np.zeros(n, bool)
+    for w in words:
+        m[max(0, int((w["start"] - 0.3) * SAMPLE_FPS)):min(n, int((w["end"] + 0.3) * SAMPLE_FPS) + 1)] = True
+    return m
+
+
+def _activity(t, n, half=round(0.6 * SAMPLE_FPS)):
+    """Movimiento medio de la boca en una ventana centrada (el análisis es offline, se puede mirar al futuro)."""
+    m = np.full(n, np.nan)
+    for i, v in t.mot.items():
+        m[i] = v
+    a = np.zeros(n)
+    for i in range(n):
+        seg = m[max(0, i - half):i + half + 1]
+        seg = seg[~np.isnan(seg)]
+        a[i] = seg.mean() if len(seg) >= 2 else 0.0
+    return a
+
+
+def _pick(tracks, n, speech):
+    """Para cada muestra, la persona que habla (o None si no hay ninguna cara). Cambia solo si otra
+    mueve claramente más la boca mientras suena voz, así no salta en las pausas ni por un gesto."""
+    act = {id(t): _activity(t, n) for t in tracks}
+    spk, cur = [], None
+    for i in range(n):
+        cand = [t for t in tracks if t.first <= i <= t.last]
+        if not cand:
+            spk.append(None)
+            cur = None
+            continue
+        if len(cand) == 1:
+            cur = cand[0]
+        else:
+            best = max(cand, key=lambda t: act[id(t)][i])
+            if cur not in cand:
+                cur = best
+            elif (best is not cur and (speech is None or speech[i])
+                  and act[id(best)][i] >= max(MIN_ACT, SWITCH * act[id(cur)][i])):
+                cur = best
+        spk.append(cur)
+    return spk
+
+
+def _runs(spk, cuts):
+    """Agrupa las muestras en planos [i0, i1, persona]. Un corte del original siempre es un corte."""
+    cut_at = {int(np.ceil(c * SAMPLE_FPS - 1e-9)) for c in cuts}
+    runs = []
+    for i, s in enumerate(spk):
+        if runs and runs[-1][2] is s and i not in cut_at:
+            runs[-1][1] = i + 1
+        else:
+            runs.append([i, i + 1, s])
+    min_n = max(1, round(MIN_SHOT * SAMPLE_FPS))
+
+    def src_shot(i):
+        return sum(1 for c in cut_at if c <= i)
+
+    def merge_once():
+        for k in sorted(range(len(runs)), key=lambda j: runs[j][1] - runs[j][0]):
+            if runs[k][1] - runs[k][0] >= min_n:
+                return False
+            left = k > 0 and src_shot(runs[k][0]) == src_shot(runs[k - 1][1] - 1)
+            right = k + 1 < len(runs) and src_shot(runs[k][1] - 1) == src_shot(runs[k + 1][0])
+            if not (left or right):
+                continue
+            if left and (not right or runs[k - 1][1] - runs[k - 1][0] >= runs[k + 1][1] - runs[k + 1][0]):
+                runs[k - 1][1] = runs[k][1]
+            else:
+                runs[k + 1][0] = runs[k][0]
+            del runs[k]
+            j = 0
+            while j + 1 < len(runs):
+                if runs[j][2] is runs[j + 1][2] and runs[j + 1][0] not in cut_at:
+                    runs[j][1] = runs[j + 1][1]
+                    del runs[j + 1]
+                else:
+                    j += 1
+            return True
+        return False
+
+    while merge_once():
+        pass
+    return runs
+
+
+def _boundary(i, cuts, words):
+    """Instante (s) en el que empieza el plano que arranca en la muestra i."""
+    t = i / SAMPLE_FPS
+    for c in cuts:
+        if t - 1 / SAMPLE_FPS < c <= t + 1e-6:
+            return c
+    near = [w["start"] for w in words if abs(w["start"] - t) <= 0.6]
+    if near:  # el corte entra justo antes de que el nuevo hablante empiece la frase
+        return max(0.0, min(near, key=lambda x: abs(x - t)) - 0.1)
+    return t
+
+
+def _median5(v):
+    return np.array([np.median(v[max(0, i - 2):i + 3]) for i in range(len(v))])
+
+
+def _lerp(keys):
+    """Expresión de FFmpeg: interpolación lineal entre keyframes [(t, valor)] en función de t."""
+    ks = []
+    for t, v in keys:
+        t = round(t, 2)
+        if not ks or t > ks[-1][0]:
+            ks.append((t, int(v)))
+    if len(ks) == 1:
+        return str(ks[0][1])
+    terms = [f"gte(t,{t0:.2f})*lt(t,{t1:.2f})*({v0}+({v1 - v0})*(t-{t0:.2f})/{t1 - t0:.2f})"
+             for (t0, v0), (t1, v1) in zip(ks, ks[1:])]
+    terms.append(f"gte(t,{ks[-1][0]:.2f})*{ks[-1][1]}")
     return "+".join(terms)
+
+
+def _frame(track, i0, i1, t0, iw, ih, o: Opts, W, H):
+    """Ventana de recorte de un plano: tamaño fijo (zoom según el tamaño de la cara) y posición que sigue a la cara."""
+    ar = W / H
+    cw_max = min(iw, ih * ar)
+    if track is None:  # sin caras: centrado y sin zoom
+        cw = int(cw_max) // 2 * 2
+        ch = int(round(cw / ar)) // 2 * 2
+        return dict(cw=cw, ch=ch, xe=str(int((iw - cw) / 2)), ye=str(int((ih - ch) / 2)))
+    idx = sorted(track.pos)
+    samples = np.arange(i0, i1)
+
+    def series(k, scale):
+        return np.interp(samples, idx, [track.pos[j][k] for j in idx]) * scale
+
+    px, py, pw = series(0, iw), series(1, ih), series(2, iw)
+    cw = cw_max
+    if o.aspect == "16:9":  # horizontal: zoom hasta que la cara ocupe `framing` del ancho
+        cw = min(cw_max, max(cw_max / MAX_ZOOM, float(np.median(pw)) / o.framing))
+        if cw > 0.93 * cw_max:
+            cw = cw_max
+    cw = int(cw) // 2 * 2
+    ch = int(round(cw / ar)) // 2 * 2
+    px, py = _median5(px), _median5(py)
+    dead_x, dead_y = 0.10 * cw, 0.12 * ch
+    cx, cy, keys = px[0], py[0], []
+    for k, s in enumerate(samples):  # operador de cámara: solo se mueve si la cara se sale de la zona muerta
+        if abs(px[k] - cx) > dead_x:
+            cx += (px[k] - cx) * 0.4
+        if abs(py[k] - cy) > dead_y:
+            cy += (py[k] - cy) * 0.4
+        x0 = int(min(max(cx - cw / 2, 0), iw - cw))
+        y0 = int(min(max(cy - FACE_Y * ch, 0), ih - ch))
+        keys.append((max(0.0, s / SAMPLE_FPS - t0), x0, y0))
+    n = len(keys)
+    keys = [k for j, k in enumerate(keys)
+            if j in (0, n - 1) or k[1:] != keys[j - 1][1:] or k[1:] != keys[j + 1][1:]]
+    return dict(cw=cw, ch=ch, xe=_lerp([(k[0], k[1]) for k in keys]), ye=_lerp([(k[0], k[2]) for k in keys]))
+
+
+def _plan_shots(src, st, en, words, o: Opts, W, H):
+    """Lista de planos [{t0, t1, cw, ch, xe, ye}] o None si no hay caras que seguir."""
+    iw, ih = _dims(src)
+    if o.aspect == "9:16" and iw / ih <= 9 / 16 + 0.05:  # ya es vertical: nada que recortar
+        return None
+    cuts = _scene_cuts(src, st, en)
+    n, tracks = _sample(src, st, en, cuts, _detector())
+    if not n or not tracks:
+        return None
+    speech = _speech_mask(words, n) if words else None
+    spk = _pick(tracks, n, speech)
+    if sum(s is not None for s in spk) < 0.3 * n:
+        return None
+    runs = _runs(spk, cuts)
+    starts = [0.0]
+    for r in runs[1:]:
+        starts.append(max(starts[-1] + 0.1, _boundary(r[0], cuts, words)))
+    ends = starts[1:] + [en - st]
+    shots = []
+    for (i0, i1, tr), a, b in zip(runs, starts, ends):
+        if b - a < 0.08 and shots:  # plano degenerado: lo absorbe el anterior
+            shots[-1]["t1"] = b
+            continue
+        shots.append(dict(t0=a, t1=b, **_frame(tr, i0, i1, a, iw, ih, o, W, H)))
+    return shots
+
+
+def _crop_graph(shots, W, H):
+    n = len(shots)
+
+    def seg(s, k):
+        trim = ""
+        if n > 1:
+            args = ([f"start={s['t0']:.3f}"] if k > 0 else []) + ([f"end={s['t1']:.3f}"] if k < n - 1 else [])
+            trim = f"trim={':'.join(args)},setpts=PTS-STARTPTS,"
+        return (f"{trim}crop=w={s['cw']}:h={s['ch']}:x='{s['xe']}':y='{s['ye']}',"
+                f"scale={W}:{H}:flags=lanczos,setsar=1")
+    if n == 1:
+        return f"[0:v]{seg(shots[0], 0)}[c]"
+    parts = ["[0:v]split=%d%s" % (n, "".join(f"[s{k}]" for k in range(n)))]
+    parts += [f"[s{k}]{seg(s, k)}[v{k}]" for k, s in enumerate(shots)]
+    parts.append("".join(f"[v{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0[c]")
+    return ";".join(parts)
 
 
 def render(video, segs, clip, out_file, o: Opts):
     st, en = clip["start"], clip["end"]
+    W, H = _size(o)
     words = [dict(w, start=w["start"] - st, end=w["end"] - st)
              for s in segs for w in s["words"] if st <= w["start"] < en]
     out_file = Path(out_file)
+    src = out_file.parent / "source.mp4"
     ass = out_file.with_suffix(".ass")
     if words:
-        _ass(words, ass)
+        _ass(words, ass, W, H)
     sub = f",ass=filename={ass.name}" if words else ""
-    mode, fallback, pan = o.mode, False, None
-    if mode == "face":
-        work = Path(tempfile.mkdtemp(prefix="_faces", dir=out_file.parent))
-        try:
-            aspect, samples = _sample_faces(out_file.parent / "source.mp4", st, en, work)
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
-        keys = _cam_path(samples) if aspect and aspect > 9 / 16 + 0.05 else None
-        if keys:
-            pan = _pan_expr(keys)
-        else:  # sin caras (diapositivas, pantalla...) o vídeo ya vertical: se conserva todo el encuadre
+    mode, fallback, shots = o.mode, False, None
+    if mode == "speaker":
+        shots = _plan_shots(src, st, en, words, o, W, H)
+        if shots is None:  # sin caras (diapositivas, pantalla...) o vídeo ya vertical: se conserva todo el encuadre
             mode, fallback = "blur", True
-    if mode == "face":
-        core = (f"[0:v]crop=w='min(iw,trunc(ih*9/16/2)*2)':h=ih:x='min(max(({pan})*iw-ow/2,0),iw-ow)':y=0,"
-                "scale=1080:1920:flags=lanczos,setsar=1[c]")
+    if mode == "speaker":
+        core = _crop_graph(shots, W, H)
     elif mode == "crop":
-        core = "[0:v]crop=ih*9/16:ih,scale=1080:1920,setsar=1[c]"
+        core = (f"[0:v]crop=w='trunc(min(iw,ih*{W}/{H})/2)*2':h='trunc(min(ih,iw*{H}/{W})/2)*2',"
+                f"scale={W}:{H},setsar=1[c]")
     else:  # fondo desenfocado + vídeo completo centrado
-        core = ("[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:5[bg];"
-                "[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[c]")
+        iw, ih = _dims(src)
+        if o.aspect == "16:9" and abs(iw / ih - 16 / 9) < 0.03:  # ya es 16:9: no hace falta fondo
+            core = f"[0:v]scale={W}:{H}:flags=lanczos,setsar=1[c]"
+        else:
+            core = (f"[0:v]split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=30:5[bg];"
+                    f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[c]")
     if o.zoom > 0 and words:
         z = _zoom_expr(_beats(words, en - st), o.zoom)
-        last = f"[c]scale=w='1080*({z})':h='1920*({z})':eval=frame,crop=1080:1920,setsar=1{sub}[v]"
+        last = f"[c]scale=w='{W}*({z})':h='{H}*({z})':eval=frame,crop={W}:{H},setsar=1{sub}[v]"
     else:
         last = f"[c]null{sub}[v]"
     vf = core + ";" + last
@@ -301,5 +625,5 @@ def run(url, out: Path, o: Opts, progress):
         used = render(video, segs, c, f, o)
         results.append({"file": f.name, "start": c["start"], "end": c["end"], "score": c["score"],
                         "title": c.get("title", f"Clip {i}"), "reason": c.get("reason", ""),
-                        "hashtags": c.get("hashtags", []), "reframe": used})
+                        "hashtags": c.get("hashtags", []), "reframe": used, "aspect": o.aspect})
     return title, results
