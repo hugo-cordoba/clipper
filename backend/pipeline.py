@@ -8,7 +8,7 @@ LLM = os.environ.get("CLIPPER_LLM", "qwen3:4b")
 WHISPER = os.environ.get("CLIPPER_WHISPER", "mlx-community/whisper-large-v3-turbo")
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 FFMPEG = next((x for x in ("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",) if os.path.exists(x)), "ffmpeg")
-
+COOKIES = os.environ.get("CLIPPER_COOKIES_BROWSER", "")
 
 @dataclass
 class Opts:
@@ -22,6 +22,8 @@ class Opts:
 def download(url, out: Path):
     opts = {"format": "bv*[height<=1080]+ba/b", "merge_output_format": "mp4",
             "outtmpl": str(out / "source.%(ext)s"), "quiet": True, "noplaylist": True}
+    if COOKIES:
+        opts["cookiesfrombrowser"] = (COOKIES,)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     return str(out / "source.mp4"), info.get("title", ""), info.get("heatmap") or []
