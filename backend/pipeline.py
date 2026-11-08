@@ -9,6 +9,7 @@ WHISPER = os.environ.get("CLIPPER_WHISPER", "mlx-community/whisper-large-v3-turb
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 FFMPEG = next((x for x in ("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",) if os.path.exists(x)), "ffmpeg")
 COOKIES = os.environ.get("CLIPPER_COOKIES_BROWSER", "")
+COOKIES_FILE = os.environ.get("CLIPPER_COOKIES_FILE", "")
 
 @dataclass
 class Opts:
@@ -22,10 +23,26 @@ class Opts:
 def download(url, out: Path):
     opts = {"format": "bv*[height<=1080]+ba/b", "merge_output_format": "mp4",
             "outtmpl": str(out / "source.%(ext)s"), "quiet": True, "noplaylist": True}
-    if COOKIES:
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    elif COOKIES:
         opts["cookiesfrombrowser"] = (COOKIES,)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+        if "Operation not permitted" in msg:
+            raise RuntimeError(
+                f"macOS bloquea las cookies de {COOKIES or 'el navegador'}. Ajustes del Sistema > Privacidad y "
+                "seguridad > Acceso total al disco: activa la app donde ejecutas ./start.sh (Terminal, iTerm...), "
+                "ciérrala con Cmd+Q, ábrela y vuelve a ejecutar ./start.sh. "
+                "Alternativa: CLIPPER_COOKIES_FILE=$HOME/cookies.txt ./start.sh") from e
+        if "not a bot" in msg or "Sign in" in msg:
+            raise RuntimeError(
+                "YouTube pide iniciar sesión. Abre YouTube en Safari con tu cuenta, comprueba que "
+                "CLIPPER_COOKIES_BROWSER=safari y que Terminal tiene Acceso total al disco.") from e
+        raise RuntimeError(msg[:300]) from e
     return str(out / "source.mp4"), info.get("title", ""), info.get("heatmap") or []
 
 
@@ -262,6 +279,7 @@ def render(video, segs, clip, out_file, o: Opts):
     vf = core + ";" + last
     cmd = [FFMPEG, "-y", "-ss", str(st), "-to", str(en), "-i", "source.mp4", "-filter_complex", vf,
            "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+           "-pix_fmt", "yuv420p",  # necesario para reproducir en Safari/iOS
            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out_file.name]
     p = subprocess.run(cmd, cwd=out_file.parent, capture_output=True, text=True)
     if p.returncode:
