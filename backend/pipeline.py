@@ -15,15 +15,26 @@ COOKIES_FILE = os.environ.get("CLIPPER_COOKIES_FILE", "")
 # --- Seguir al que habla ---
 YUNET = Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx"
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-SAMPLE_FPS = 6             # muestras de cara por segundo
-SAMPLE_W = 1280            # ancho al que se analizan los fotogramas
+SAMPLE_FPS = 10            # muestras de cara por segundo (más muestras = labios mejor medidos)
+SAMPLE_W = 1024            # ancho al que se analizan los fotogramas
 HOLD = 3 * SAMPLE_FPS      # una cara perdida se sigue buscando 3 s
-MIN_TRACK = 5              # muestras mínimas para que una pista cuente como persona
+MIN_TRACK = round(0.8 * SAMPLE_FPS)  # muestras mínimas para que una pista cuente como persona
 CUT_DIFF = 15              # diferencia media (0-255) entre miniaturas que cuenta como corte de plano
-MIN_SHOT = 1.5             # s: duración mínima de un plano al cambiar de hablante
-SWITCH = 1.25              # el nuevo hablante debe mover la boca un 25 % más que el actual
-MIN_ACT = 0.12             # movimiento de boca mínimo para considerar que alguien habla
+MIN_ACT = 0.10             # movimiento de boca mínimo para considerar que alguien habla (se limita solo si el vídeo es muy "tranquilo")
+ONSET_GAP = 0.35           # s de silencio tras los que una frase nueva cuenta como arranque de turno
+ONSET_LEN = 0.8            # s tras el arranque en los que basta con mover la boca más que el otro
+KEY_EVERY = max(1, round(SAMPLE_FPS / 6))  # un keyframe de cámara cada N muestras (mantiene corto el filtro de FFmpeg)
+CAM_EASE = 1 - 0.6 ** (6 / SAMPLE_FPS)     # suavizado de cámara por muestra, independiente de SAMPLE_FPS
+# Ritmo de cortes al cambiar de hablante:
+#   min_shot: duración mínima de un plano (s) · switch: cuánto más debe mover la boca el nuevo hablante
+#   dwell: tiempo (s) que debe mantener esa ventaja · window: semiventana (s) con la que se mide la actividad
+PACES = {
+    "calm":   dict(min_shot=2.0, switch=1.40, dwell=0.50, window=0.6),
+    "normal": dict(min_shot=1.0, switch=1.20, dwell=0.30, window=0.4),
+    "fast":   dict(min_shot=0.7, switch=1.10, dwell=0.20, window=0.3),
+}
 MAX_ZOOM = 2.5             # recorte máximo sobre el original (más borroso a partir de aquí)
+CROP_MIN_ZOOM = 1.35       # 16:9 + recorte central: zoom mínimo (siempre es un recorte, nunca el plano completo)
 FACE_Y = 0.42              # la cara queda al 42 % de la altura del encuadre
 
 
@@ -35,7 +46,8 @@ class Opts:
     max_len: int = 60
     zoom: float = 0.12
     aspect: str = "9:16"     # "9:16" vertical | "16:9" horizontal (YouTube)
-    framing: float = 0.17    # solo 16:9 + speaker: ancho de la cara / ancho del encuadre (menor = plano más abierto)
+    framing: float = 0.17    # solo 16:9 + speaker/crop: ancho de la cara / ancho del encuadre (menor = plano más abierto)
+    pace: str = "normal"     # calm | normal | fast: cuántos cambios de plano al alternar hablantes
 
 
 def _size(o: Opts):
@@ -309,6 +321,15 @@ def _mouth_patch(gray, b):
     return (p - p.mean()) / (p.std() + 1.0)
 
 
+def _patch_motion(a, b):
+    """Diferencia media entre dos imágenes de boca tolerando un desplazamiento de ±1 px: el temblor del
+    detector o un cabeceo no cuentan como hablar; abrir y cerrar los labios sí."""
+    h, w = a.shape
+    core = a[1:h - 1, 1:w - 1]
+    return float(min(np.abs(core - b[1 + dy:h - 1 + dy, 1 + dx:w - 1 + dx]).mean()
+                     for dy in (-1, 0, 1) for dx in (-1, 0, 1)))
+
+
 def _track_step(tracks, i, faces, gray):
     h, w = gray.shape
     live = [t for t in tracks if t.open and i - t.last <= HOLD]
@@ -330,7 +351,7 @@ def _track_step(tracks, i, faces, gray):
         used.add(id(best))
         patch = _mouth_patch(gray, best.box)
         if patch is not None and best.patch is not None and best.last == i - 1:
-            best.mot[i] = float(np.abs(patch - best.patch).mean())
+            best.mot[i] = _patch_motion(patch, best.patch)
         best.patch = patch
         best.last = i
         b = best.box
@@ -373,7 +394,18 @@ def _speech_mask(words, n):
     return m
 
 
-def _activity(t, n, half=round(0.6 * SAMPLE_FPS)):
+def _onset_mask(words, n):
+    """Muestras que caen justo después de un silencio: ahí es donde suele cambiar el turno de palabra."""
+    m = np.zeros(n, bool)
+    prev_end = None
+    for w in words:
+        if prev_end is None or w["start"] - prev_end >= ONSET_GAP:
+            m[max(0, int((w["start"] - 0.1) * SAMPLE_FPS)):min(n, int((w["start"] + ONSET_LEN) * SAMPLE_FPS) + 1)] = True
+        prev_end = w["end"]
+    return m
+
+
+def _activity(t, n, half):
     """Movimiento medio de la boca en una ventana centrada (el análisis es offline, se puede mirar al futuro)."""
     m = np.full(n, np.nan)
     for i, v in t.mot.items():
@@ -386,31 +418,46 @@ def _activity(t, n, half=round(0.6 * SAMPLE_FPS)):
     return a
 
 
-def _pick(tracks, n, speech):
-    """Para cada muestra, la persona que habla (o None si no hay ninguna cara). Cambia solo si otra
-    mueve claramente más la boca mientras suena voz, así no salta en las pausas ni por un gesto."""
-    act = {id(t): _activity(t, n) for t in tracks}
-    spk, cur = [], None
+def _pick(tracks, n, speech, onset, p):
+    """Para cada muestra, la persona que habla (o None si no hay ninguna cara).
+    - Cambia solo si otra mueve claramente más la boca mientras suena voz, así no salta en las pausas ni por un gesto.
+    - La ventaja debe mantenerse `dwell` segundos; al confirmarse, el cambio se adelanta al momento en que empezó
+      (el análisis es offline), así el corte no llega tarde.
+    - Justo después de un silencio (arranque de turno) basta con mover más la boca y se confirma antes."""
+    half = max(1, round(p["window"] * SAMPLE_FPS))
+    act = {id(t): _activity(t, n, half) for t in tracks}
+    vals = np.concatenate([a[a > 0] for a in act.values()]) if act else np.array([])
+    min_act = min(MIN_ACT, 0.35 * float(np.percentile(vals, 75))) if len(vals) else MIN_ACT
+    need = max(1, round(p["dwell"] * SAMPLE_FPS))
+    need_on = max(2, need // 2)
+    spk, cur, lead, lead_n = [], None, None, 0
     for i in range(n):
         cand = [t for t in tracks if t.first <= i <= t.last]
         if not cand:
             spk.append(None)
-            cur = None
+            cur, lead, lead_n = None, None, 0
             continue
-        if len(cand) == 1:
-            cur = cand[0]
+        if len(cand) == 1 or cur not in cand:
+            cur = cand[0] if len(cand) == 1 else max(cand, key=lambda t: act[id(t)][i])
+            lead, lead_n = None, 0
         else:
             best = max(cand, key=lambda t: act[id(t)][i])
-            if cur not in cand:
-                cur = best
-            elif (best is not cur and (speech is None or speech[i])
-                  and act[id(best)][i] >= max(MIN_ACT, SWITCH * act[id(cur)][i])):
-                cur = best
+            ratio, k = (1.0, need_on) if (onset is not None and onset[i]) else (p["switch"], need)
+            if (best is not cur and (speech is None or speech[i])
+                    and act[id(best)][i] >= max(min_act, ratio * act[id(cur)][i])):
+                lead_n = lead_n + 1 if lead is best else 1
+                lead = best
+                if lead_n >= k:
+                    for j in range(i - lead_n + 1, i):  # el cambio se adelanta al inicio de la ventaja
+                        spk[j] = best
+                    cur, lead, lead_n = best, None, 0
+            else:
+                lead, lead_n = None, 0
         spk.append(cur)
     return spk
 
 
-def _runs(spk, cuts):
+def _runs(spk, cuts, min_shot):
     """Agrupa las muestras en planos [i0, i1, persona]. Un corte del original siempre es un corte."""
     cut_at = {int(np.ceil(c * SAMPLE_FPS - 1e-9)) for c in cuts}
     runs = []
@@ -419,7 +466,7 @@ def _runs(spk, cuts):
             runs[-1][1] = i + 1
         else:
             runs.append([i, i + 1, s])
-    min_n = max(1, round(MIN_SHOT * SAMPLE_FPS))
+    min_n = max(1, round(min_shot * SAMPLE_FPS))
 
     def src_shot(i):
         return sum(1 for c in cut_at if c <= i)
@@ -464,8 +511,9 @@ def _boundary(i, cuts, words):
     return t
 
 
-def _median5(v):
-    return np.array([np.median(v[max(0, i - 2):i + 3]) for i in range(len(v))])
+def _smooth(v, half=round(0.4 * SAMPLE_FPS)):
+    """Mediana móvil (~0,9 s): quita saltos sueltos del detector."""
+    return np.array([np.median(v[max(0, i - half):i + half + 1]) for i in range(len(v))])
 
 
 def _lerp(keys):
@@ -483,12 +531,13 @@ def _lerp(keys):
     return "+".join(terms)
 
 
-def _frame(track, i0, i1, t0, iw, ih, o: Opts, W, H):
-    """Ventana de recorte de un plano: tamaño fijo (zoom según el tamaño de la cara) y posición que sigue a la cara."""
+def _frame(track, i0, i1, t0, iw, ih, o: Opts, W, H, central=False):
+    """Ventana de recorte de un plano: tamaño fijo (zoom según el tamaño de la cara) y posición que sigue a la cara.
+    central=True (16:9 + recorte central): siempre es un recorte, con al menos CROP_MIN_ZOOM de zoom."""
     ar = W / H
     cw_max = min(iw, ih * ar)
-    if track is None:  # sin caras: centrado y sin zoom
-        cw = int(cw_max) // 2 * 2
+    if track is None:  # sin caras: centrado (y con zoom fijo si es recorte central)
+        cw = int(cw_max / CROP_MIN_ZOOM if central else cw_max) // 2 * 2
         ch = int(round(cw / ar)) // 2 * 2
         return dict(cw=cw, ch=ch, xe=str(int((iw - cw) / 2)), ye=str(int((ih - ch) / 2)))
     idx = sorted(track.pos)
@@ -501,28 +550,31 @@ def _frame(track, i0, i1, t0, iw, ih, o: Opts, W, H):
     cw = cw_max
     if o.aspect == "16:9":  # horizontal: zoom hasta que la cara ocupe `framing` del ancho
         cw = min(cw_max, max(cw_max / MAX_ZOOM, float(np.median(pw)) / o.framing))
-        if cw > 0.93 * cw_max:
+        if central:  # recorte central: nunca más abierto que CROP_MIN_ZOOM
+            cw = min(cw, cw_max / CROP_MIN_ZOOM)
+        elif cw > 0.93 * cw_max:
             cw = cw_max
     cw = int(cw) // 2 * 2
     ch = int(round(cw / ar)) // 2 * 2
-    px, py = _median5(px), _median5(py)
+    px, py = _smooth(px), _smooth(py)
     dead_x, dead_y = 0.10 * cw, 0.12 * ch
     cx, cy, keys = px[0], py[0], []
     for k, s in enumerate(samples):  # operador de cámara: solo se mueve si la cara se sale de la zona muerta
         if abs(px[k] - cx) > dead_x:
-            cx += (px[k] - cx) * 0.4
+            cx += (px[k] - cx) * CAM_EASE
         if abs(py[k] - cy) > dead_y:
-            cy += (py[k] - cy) * 0.4
+            cy += (py[k] - cy) * CAM_EASE
         x0 = int(min(max(cx - cw / 2, 0), iw - cw))
         y0 = int(min(max(cy - FACE_Y * ch, 0), ih - ch))
         keys.append((max(0.0, s / SAMPLE_FPS - t0), x0, y0))
+    keys = keys[::KEY_EVERY] + ([keys[-1]] if (len(keys) - 1) % KEY_EVERY else [])
     n = len(keys)
     keys = [k for j, k in enumerate(keys)
             if j in (0, n - 1) or k[1:] != keys[j - 1][1:] or k[1:] != keys[j + 1][1:]]
     return dict(cw=cw, ch=ch, xe=_lerp([(k[0], k[1]) for k in keys]), ye=_lerp([(k[0], k[2]) for k in keys]))
 
 
-def _plan_shots(src, st, en, words, o: Opts, W, H):
+def _plan_shots(src, st, en, words, o: Opts, W, H, central=False):
     """Lista de planos [{t0, t1, cw, ch, xe, ye}] o None si no hay caras que seguir."""
     iw, ih = _dims(src)
     if o.aspect == "9:16" and iw / ih <= 9 / 16 + 0.05:  # ya es vertical: nada que recortar
@@ -531,11 +583,13 @@ def _plan_shots(src, st, en, words, o: Opts, W, H):
     n, tracks = _sample(src, st, en, cuts, _detector())
     if not n or not tracks:
         return None
+    p = PACES.get(o.pace, PACES["normal"])
     speech = _speech_mask(words, n) if words else None
-    spk = _pick(tracks, n, speech)
+    onset = _onset_mask(words, n) if words else None
+    spk = _pick(tracks, n, speech, onset, p)
     if sum(s is not None for s in spk) < 0.3 * n:
         return None
-    runs = _runs(spk, cuts)
+    runs = _runs(spk, cuts, p["min_shot"])
     starts = [0.0]
     for r in runs[1:]:
         starts.append(max(starts[-1] + 0.1, _boundary(r[0], cuts, words)))
@@ -545,7 +599,7 @@ def _plan_shots(src, st, en, words, o: Opts, W, H):
         if b - a < 0.08 and shots:  # plano degenerado: lo absorbe el anterior
             shots[-1]["t1"] = b
             continue
-        shots.append(dict(t0=a, t1=b, **_frame(tr, i0, i1, a, iw, ih, o, W, H)))
+        shots.append(dict(t0=a, t1=b, **_frame(tr, i0, i1, a, iw, ih, o, W, H, central)))
     return shots
 
 
@@ -578,12 +632,18 @@ def render(video, segs, clip, out_file, o: Opts):
     if words:
         _ass(words, ass, W, H)
     sub = f",ass=filename={ass.name}" if words else ""
-    mode, fallback, shots = o.mode, False, None
-    if mode == "speaker":
-        shots = _plan_shots(src, st, en, words, o, W, H)
-        if shots is None:  # sin caras (diapositivas, pantalla...) o vídeo ya vertical: se conserva todo el encuadre
+    mode, fallback, shots, label = o.mode, False, None, o.mode
+    central = mode == "crop" and o.aspect == "16:9"  # recorte central horizontal: a pantalla completa y siguiendo al que habla
+    if mode == "speaker" or central:
+        shots = _plan_shots(src, st, en, words, o, W, H, central)
+        if shots is not None:
+            label = "crop_track" if central else "speaker"
+        elif central:  # sin caras: recorte central fijo (sigue siendo un recorte, no el plano completo)
+            iw, ih = _dims(src)
+            shots = [dict(t0=0.0, t1=en - st, **_frame(None, 0, 0, 0.0, iw, ih, o, W, H, True))]
+        else:  # sin caras (diapositivas, pantalla...) o vídeo ya vertical: se conserva todo el encuadre
             mode, fallback = "blur", True
-    if mode == "speaker":
+    if shots:
         core = _crop_graph(shots, W, H)
     elif mode == "crop":
         core = (f"[0:v]crop=w='trunc(min(iw,ih*{W}/{H})/2)*2':h='trunc(min(ih,iw*{H}/{W})/2)*2',"
@@ -608,7 +668,7 @@ def render(video, segs, clip, out_file, o: Opts):
     p = subprocess.run(cmd, cwd=out_file.parent, capture_output=True, text=True)
     if p.returncode:
         raise RuntimeError("FFmpeg falló: " + p.stderr[-300:])
-    return "fallback" if fallback else mode
+    return "fallback" if fallback else label
 
 
 def run(url, out: Path, o: Opts, progress):

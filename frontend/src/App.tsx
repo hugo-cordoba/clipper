@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils"
 
 type Mode = "blur" | "crop" | "speaker"
 type Aspect = "9:16" | "16:9"
+type Pace = "calm" | "normal" | "fast"
 type Clip = { url: string; title: string; reason: string; hashtags: string[]; score: number; start: number; end: number; reframe?: string; aspect?: Aspect }
 type Job = { id: string; status: string; stage: string; progress: number; title?: string; clips: Clip[]; error?: string }
 
@@ -18,6 +19,7 @@ const ASPECTS: Record<Aspect, string> = { "9:16": "Vertical 9:16", "16:9": "Hori
 const REFRAME: Record<string, string> = {
   blur: "Fondo desenfocado",
   crop: "Recorte central",
+  crop_track: "Recorte central siguiendo al que habla",
   speaker: "Seguimiento del que habla",
   fallback: "Sin recorte (no se detectaron caras)",
 }
@@ -35,6 +37,13 @@ const ZOOMS = [
   { label: "Fuerte", v: 0.18 },
 ]
 
+// Cuántos cambios de plano hace al alternar los que hablan
+const PACES: { label: string; v: Pace; hint: string }[] = [
+  { label: "Pocos", v: "calm", hint: "Solo cambia cuando alguien habla un rato seguido; ignora las réplicas cortas." },
+  { label: "Normal", v: "normal", hint: "Cambia al hablar otra persona, incluso en réplicas de un segundo." },
+  { label: "Muchos", v: "fast", hint: "Cambia en cuanto alguien responde, aunque sea un momento." },
+]
+
 // Cuánto del ancho del encuadre ocupa la cara (más alto = plano más cerrado)
 const FRAMINGS = [
   { label: "Amplio", v: 0.12 },
@@ -50,13 +59,26 @@ export default function App() {
   const [len, setLen] = useState({ lo: 20, hi: 60 })
   const [zoom, setZoom] = useState(0.12)
   const [framing, setFraming] = useState(0.17)
+  const [pace, setPace] = useState<Pace>("normal")
   const [job, setJob] = useState<Job | null>(null)
   const [err, setErr] = useState("")
   const busy = job?.status === "running"
   const badLen = len.lo >= len.hi
   const horizontal = aspect === "16:9"
-  const modes = (Object.keys(MODES) as Mode[]).filter((m) => !(horizontal && m === "crop"))
-  const modeLabel = (m: Mode) => (horizontal && m === "blur" ? "Plano completo" : MODES[m])
+  const modes = Object.keys(MODES) as Mode[]
+  const tracking = mode === "speaker" || (horizontal && mode === "crop") // modos que siguen al que habla
+  const modeLabel = (m: Mode) => {
+    if (!horizontal) return MODES[m]
+    if (m === "blur") return "Plano completo"
+    if (m === "crop") return "Recorte central con seguimiento"
+    return MODES[m]
+  }
+  const modeHint =
+    horizontal && mode === "crop"
+      ? "Pantalla completa con recorte; el encuadre sigue a quien habla. Si no se detectan caras, recorta al centro."
+      : horizontal && mode === "speaker"
+        ? "El plano se adapta al tamaño de la cara. Si no se detectan caras, se muestra el plano completo."
+        : ""
   const reframeLabel = (c: Clip) => (c.aspect === "16:9" && c.reframe === "blur" ? "Plano completo" : c.reframe ? REFRAME[c.reframe] : undefined)
   const wide = job?.clips[0]?.aspect === "16:9"
 
@@ -67,8 +89,9 @@ export default function App() {
   }, [busy, job?.id])
 
   function pickAspect(a: Aspect) {
+    if (a === aspect) return
     setAspect(a)
-    if (a === "16:9" && mode === "crop") setMode("speaker") // el recorte central no aplica en horizontal
+    if (a === "16:9") setMode("crop") // en horizontal, el recorte central también sigue al que habla
   }
 
   async function start() {
@@ -76,7 +99,7 @@ export default function App() {
     const r = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, num_clips: n, mode, min_len: len.lo, max_len: len.hi, zoom, aspect, framing }),
+      body: JSON.stringify({ url, num_clips: n, mode, min_len: len.lo, max_len: len.hi, zoom, aspect, framing, pace }),
     })
     if (!r.ok) {
       const d = (await r.json()).detail
@@ -112,7 +135,7 @@ export default function App() {
               Clips
               <Input type="number" min={1} max={10} value={n} onChange={(e) => setN(+e.target.value)} className="w-20" disabled={busy} />
             </label>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {modes.map((m) => (
                 <Button key={m} size="sm" variant={mode === m ? "default" : "outline"} onClick={() => setMode(m)} disabled={busy}>
                   {modeLabel(m)}
@@ -124,7 +147,9 @@ export default function App() {
             </Button>
           </div>
 
-          {horizontal && mode === "speaker" && (
+          {modeHint && <p className="text-xs text-muted-foreground">{modeHint}</p>}
+
+          {horizontal && tracking && (
             <div className="flex flex-wrap items-center gap-2 text-sm">
               <span className="mr-1">Encuadre</span>
               {FRAMINGS.map((f) => (
@@ -134,6 +159,22 @@ export default function App() {
                   {f.label}
                 </Button>
               ))}
+            </div>
+          )}
+
+          {tracking && (
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="mr-1">Cambios de plano</span>
+                {PACES.map((p) => (
+                  <Button key={p.v} size="sm" disabled={busy}
+                    variant={pace === p.v ? "default" : "outline"}
+                    onClick={() => setPace(p.v)}>
+                    {p.label}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">{PACES.find((p) => p.v === pace)?.hint}</p>
             </div>
           )}
 

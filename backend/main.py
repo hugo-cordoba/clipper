@@ -22,7 +22,8 @@ class Req(BaseModel):
     max_len: int = Field(60, ge=10, le=180)
     zoom: float = Field(0.12, ge=0, le=0.4)  # 0 = sin zoom
     aspect: Literal["9:16", "16:9"] = "9:16"  # 16:9 = formato YouTube, a pantalla completa
-    framing: float = Field(0.17, ge=0.08, le=0.45)  # solo 16:9 + speaker: cuánto ocupa la cara
+    framing: float = Field(0.17, ge=0.08, le=0.45)  # solo 16:9 + speaker/crop: cuánto ocupa la cara
+    pace: Literal["calm", "normal", "fast"] = "normal"  # cuántos cambios de plano al alternar hablantes
 
 
 def work(jid: str, r: Req):
@@ -33,7 +34,7 @@ def work(jid: str, r: Req):
 
     with LOCK:
         try:
-            opts = pipeline.Opts(r.num_clips, r.mode, r.min_len, r.max_len, r.zoom, r.aspect, r.framing)
+            opts = pipeline.Opts(r.num_clips, r.mode, r.min_len, r.max_len, r.zoom, r.aspect, r.framing, r.pace)
             title, clips = pipeline.run(r.url, OUT / jid, opts, progress)
             for c in clips:
                 c["url"] = f"/clips/{jid}/{c['file']}"
