@@ -2,5 +2,5 @@
   "$schema": "https://ui.shadcn.com/schema.json",
   "style": "new-york", "rsc": false, "tsx": true,
   "tailwind": { "config": "", "css": "src/index.css", "baseColor": "zinc", "cssVariables": true },
-  "aliases": { "components": "@/components", "utils": "@/lib/utils", "ui": "@/components/ui", "lib": "@/lib" }
+  "aliases": { "hooks": "@/components/hooks", "components": "@/components", "utils": "@/lib/utils", "ui": "@/components/ui", "lib": "@/lib" }
 }
